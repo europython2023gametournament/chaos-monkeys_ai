@@ -8,7 +8,7 @@ from typing import Callable
 import numpy as np
 
 # This is your team name
-CREATOR = "Łukasz"
+CREATOR = "ChaosMonkeys"
 
 
 @dataclasses.dataclass
