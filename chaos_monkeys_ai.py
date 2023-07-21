@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 import dataclasses
+import itertools
+from collections import defaultdict
+from functools import lru_cache
 from typing import Callable
 
 import numpy as np
 
 # This is your team name
-CREATOR = "ChaosMonkeys"
+CREATOR = "Łukasz"
 
 
 @dataclasses.dataclass
@@ -30,6 +33,8 @@ class PlayerAi:
         self.nships = {}
         self.ships = {}
         self.njets = {}
+        self.jets_def = defaultdict(set)
+        self.bases_under_attack = defaultdict(None)
 
     def build_mine(self, base):
         if base.crystal > base.cost("mine"):
@@ -63,17 +68,23 @@ class PlayerAi:
         if base.crystal > base.cost("jet"):
             # build_jet() returns the uid of the jet that was built
             jet_uid = base.build_jet(heading=360 * np.random.random())
-            self.njets[base.uid] += 1
+            # self.njets[base.uid] += 1
+            self.jets_def[base.uid].add(jet_uid)
 
     stages = [
         Stage("mines", 2, build_mine),
-        Stage("tanks_def", 8, build_tank_def),
-        Stage("mines", 3, build_mine),
+        Stage("tanks_def", 3, build_tank_def),
         Stage("ships", 1, build_ship),
+        Stage("tanks_att", 1, build_tank_att),
+        Stage("mines", 3, build_mine),
+        Stage("ships", 2, build_ship),
+        Stage("tanks_def", 6, build_tank_def),
+        Stage("jets", 1, build_jet),
+        Stage("ships", 2, build_jet),
         Stage("tanks_def", 9, build_tank_def),
         Stage("tanks_att", 2, build_tank_att),
         Stage("ships", 2, build_ship),
-        Stage("jets", 1, build_jet),
+        Stage("jets", 2, build_jet),
         Stage("ships", 3, build_ship),
         Stage("tanks_def", 10, build_tank_def),
         Stage("jets", 1, build_jet),
@@ -105,6 +116,19 @@ class PlayerAi:
             for ship in ships_to_remove:
                 ships.remove(ship)
 
+        # do the same for jets
+        alive_jets = []
+        if "jets" in player_info:
+            alive_jets = [jet.uid for jet in player_info["jets"]]
+        for base, jets in self.jets_def.items():
+            jets_to_remove = {jet for jet in jets if jet not in alive_jets}
+            for jet in jets_to_remove:
+                jets.remove(jet)
+
+    @lru_cache()
+    def cycle(self, base):
+        return itertools.cycle((self.__class__.build_tank_def, self.__class__.build_jet, self.__class__.build_tank_att, self.__class__.build_ship))
+
     def get_next_stage(self, base) -> Callable:
         for stage in self.stages:
             if stage.item == "mines":
@@ -116,13 +140,43 @@ class PlayerAi:
             elif stage.item == "tanks_att":
                 if len(self.tanks_att[base.uid]) < stage.count:
                     return stage.action
-            elif stage.item == "ships":
+            elif stage.item == "ships" and not self.already_built_ships_and_not_jet(
+                base, stage.count
+            ):
                 if len(self.ships[base.uid]) < stage.count:
                     return stage.action
             elif stage.item == "jets":
-                if self.njets[base.uid] < stage.count:
+                if len(self.jets_def[base.uid]) < stage.count:
                     return stage.action
-        return self.__class__.build_ship
+        return next(self.cycle(base))
+
+    def get_enemy_vehicles(self, info):
+        vehicles = []
+        for team_name, team_info in info.items():
+            if team_name == self.team:
+                continue
+            vehicles.extend(
+                team_info.get("tanks", [])
+                + team_info.get("ships", [])
+                + team_info.get("jets", [])
+            )
+        return vehicles
+
+    def get_enemy_bases(self, info):
+        bases = []
+        for team_name, team_info in info.items():
+            if team_name == self.team:
+                continue
+            bases.extend(team_info.get("bases", []))
+        return bases
+
+    def get_enemy_ships(self, info):
+        ships = []
+        for team_name, team_info in info.items():
+            if team_name == self.team:
+                continue
+            ships.extend(team_info.get("ships", []))
+        return ships
 
     def run(self, t: float, dt: float, info: dict, game_map: np.ndarray):
         """
@@ -186,6 +240,7 @@ class PlayerAi:
         # base.build_jet(): build a jet
 
         # Iterate through all my bases (vehicles belong to bases)
+        self.bases_under_attack = defaultdict(None)
         for base in myinfo["bases"]:
             # If this is a new base, initialize the tank & ship counters
             if base.uid not in self.ntanks_def:
@@ -202,14 +257,33 @@ class PlayerAi:
                 self.tanks_att[base.uid] = set()
             if base.uid not in self.ships:
                 self.ships[base.uid] = set()
+            closest_enemy = min(
+                self.get_enemy_vehicles(info),
+                key=lambda vehicle: base.get_distance(vehicle.x, vehicle.y),
+                default=None,
+            )
+            if (
+                closest_enemy
+                and base.get_distance(closest_enemy.x, closest_enemy.y) < 100
+            ):
+                self.bases_under_attack[base.uid] = (closest_enemy.x, closest_enemy.y)
+            else:
+                self.bases_under_attack[base.uid] = None
 
             self.update_vehicles(myinfo)
             action = self.get_next_stage(base)
-            print(action)
+            print(
+                action,
+                base.uid,
+                base.mines,
+                f"{base.crystal=} {base.mines=} {len(self.tanks_def[base.uid])=} {len(self.tanks_att[base.uid])=} {self.jets_def[base.uid]=}",
+            )
             action(self, base)
 
         # Try to find an enemy target
         target = None
+        target_per_base = self.get_target_per_base(info)
+        target_per_tank = self.get_target_per_tank(info)
         # If there are multiple teams in the info, find the first team that is not mine
         if len(info) > 1:
             for name in info:
@@ -273,6 +347,27 @@ class PlayerAi:
                         if 40 < tank.get_distance(base.x, base.y, shortest=True) < 50:
                             tank.set_heading(-tank.heading)
                             tank.set_vector(tank.vector * -1)
+                    elif (
+                        tank.uid in self.tanks_att[base.uid]
+                    ):
+                        if target_per_base[base.uid] is not None:
+                            tank.goto(
+                                target_per_base[base.uid].x, target_per_base[base.uid].y
+                            )
+                        elif target_per_tank[tank.uid] is not None:
+                            tank.goto(target_per_tank[tank.uid].x, target_per_tank[tank.uid].y)
+                if self.bases_under_attack.get(tank.owner.uid):
+                    tank.goto(*self.bases_under_attack[tank.owner.uid])
+                if (
+                    not self.get_base_by_uid(info, tank.owner.uid)
+                    and tank.uid in self.tanks_def[tank.owner.uid]
+                ):  # base is destroyed
+                    self.tanks_def[tank.owner.uid].remove(tank.uid)
+                    self.tanks_att[tank.owner.uid].add(tank.uid)
+                    if target_per_tank[tank.uid] is not None:
+                        tank.goto(target_per_tank[tank.uid].x, target_per_tank[tank.uid].y)
+                    else:
+                        tank.set_heading(np.random.random() * 360.0)
         if "tanks" in myinfo:
             for tank in myinfo["tanks"]:
                 if (tank.uid in self.previous_positions) and (not tank.stopped):
@@ -281,9 +376,10 @@ class PlayerAi:
                     if all(tank.position == self.previous_positions[tank.uid]):
                         tank.set_heading(np.random.random() * 360.0)
                     # Else, if there is a target, go to the target
-                    elif target is not None:
-                        tank.goto(*target)
-                # Store the previous position of this tank for the next time step
+                    # elif target is not None:
+                    #     tank.goto(*target)
+                # Store the previous position of this
+                # tank for the next time step
                 self.previous_positions[tank.uid] = tank.position
 
         # Iterate through all my ships
@@ -295,7 +391,7 @@ class PlayerAi:
                     # set a random heading otherwise
                     if all(ship.position == self.previous_positions[ship.uid]):
                         if all(
-                            ship.get_distance(base.x, base.y, shortest=True) > 40
+                            ship.get_distance(base.x, base.y, shortest=True) > 60
                             for team_info in info.values()
                             for base in team_info.get("bases", [])
                         ):
@@ -308,14 +404,102 @@ class PlayerAi:
         # Iterate through all my jets
         if "jets" in myinfo:
             for jet in myinfo["jets"]:
-                if any(
-                    120 < jet.get_distance(base.x, base.y, shortest=True) < 150
-                    for base in myinfo["bases"]
+                if self.bases_under_attack[jet.owner.uid]:
+                    jet.goto(*self.bases_under_attack[jet.owner.uid])
+                    print("[JET] ")
+                elif (
+                    enemy := self.find_nearest_enemy_ship(
+                        info, self.get_base_by_uid(info, jet.owner.uid), 300
+                    )
+                ) is not None:
+                    print("FOUND SHIP TO ATTACK", enemy.x, enemy.y)
+                    jet.goto(enemy.x, enemy.y)
+                elif (
+                    target_per_base[jet.owner.uid] is not None
+                    and jet.get_distance(
+                        target_per_base[jet.owner.uid].x,
+                        target_per_base[jet.owner.uid].y,
+                )
                 ):
-                    jet.set_heading(-jet.heading)
-                    jet.set_vector(jet.vector * -1)
-        if "jets" in myinfo:
-            for jet in myinfo["jets"]:
-                # Jets simply go to the target if there is one, they never get stuck
-                if target is not None:
-                    jet.goto(*target)
+                    jet.goto(
+                        target_per_base[jet.owner.uid].x,
+                        target_per_base[jet.owner.uid].y,
+                    )
+                elif nearest_base := min(
+                    [
+                        base
+                        for base in myinfo["bases"]
+                        if 100 < jet.get_distance(base.x, base.y) < 110
+                    ],
+                    key=lambda b: jet.get_distance(b.x, b.y), default=None
+                ):
+                    jet.goto(nearest_base.x, nearest_base.y)
+                    jet.set_heading(jet.heading + (2* np.random.random() -1) * 30)
+                elif jet.uid in self.previous_positions and all(
+                    jet.position == self.previous_positions[jet.uid]
+                ):
+                    # base_pos = myinfo["bases"][0].x, myinfo["bases"][0].y
+                    # if jet.get_distance(*base_pos) > 50:
+                    #     jet.goto(*base_pos)
+                    # else:
+                    jet.set_heading(np.random.random() * 360.0)
+
+                self.previous_positions[jet.uid] = jet.position
+
+        # if "jets" in myinfo:
+        #     for jet in myinfo["jets"]:
+        #         # Jets simply go to the target if there is one, they never get stuck
+        #         if target is not None:
+        #             jet.goto(*target)
+
+    def already_built_ships_and_not_jet(self, base, desired_count: int):
+        if self.nships[base.uid] >= desired_count and len(self.jets_def[base.uid]) == 0:
+            return True
+
+    def get_target_per_base(self, info):
+        result = defaultdict(None)
+        enemy_bases = self.get_enemy_bases(info)
+        for base in info[self.team]["bases"]:
+            result[base.uid] = min(
+                enemy_bases,
+                key=lambda enemy_base: base.get_distance(enemy_base.x, enemy_base.y),
+                default=None,
+            )
+        return result
+
+    def find_nearest_enemy_ship(self, info, base, distance_limit=None):
+        """
+        Find the nearest enemy ship to the given base.
+        """
+        result = min(
+            self.get_enemy_ships(info),
+            key=lambda ship: base.get_distance(ship.x, ship.y),
+            default=None,
+        )
+        if (
+            result
+            and distance_limit
+            and base.get_distance(result.x, result.y) < distance_limit
+        ):
+            return result
+        return None
+
+    def get_base_by_uid(self, info, uid):
+        for values in info.values():
+            for base in values.get("bases", []):
+                if base.uid == uid:
+                    return base
+        return None
+
+    def get_target_per_tank(self, info):
+        result = defaultdict(None)
+        enemy_bases = self.get_enemy_bases(info)
+        for tank in info[self.team].get("tanks", []):
+            result[tank.uid] = min(
+                enemy_bases,
+                key=lambda enemy_base: tank.get_distance(
+                    enemy_base.x, enemy_base.y, shortest=True
+                ),
+                default=None,
+            )
+        return result
