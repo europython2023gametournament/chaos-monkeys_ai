@@ -1,9 +1,18 @@
 # SPDX-License-Identifier: BSD-3-Clause
+import dataclasses
+from typing import Callable
 
 import numpy as np
 
 # This is your team name
-CREATOR = "TeamName"
+CREATOR = "ChaosMonkeys"
+
+
+@dataclasses.dataclass
+class Stage:
+    item: str
+    count: int
+    action: Callable
 
 
 # This is the AI bot that will be instantiated for the competition
@@ -14,8 +23,106 @@ class PlayerAi:
         # Record the previous positions of all my vehicles
         self.previous_positions = {}
         # Record the number of tanks and ships I have at each base
-        self.ntanks = {}
+        self.ntanks_def = {}
+        self.tanks_def = {}
+        self.ntanks_att = {}
+        self.tanks_att = {}
         self.nships = {}
+        self.ships = {}
+        self.njets = {}
+
+    def build_mine(self, base):
+        if base.crystal > base.cost("mine"):
+            base.build_mine()
+
+    def build_tank_def(self, base):
+        if base.crystal > base.cost("tank"):
+            tank_uid = base.build_tank(heading=360 * np.random.random())
+            # build_tank() returns the uid of the tank that was built
+            self.tanks_def[base.uid].add(tank_uid)
+            # Add 1 to the tank counter for this base
+            self.ntanks_def[base.uid] += 1
+
+    def build_tank_att(self, base):
+        if base.crystal > base.cost("tank"):
+            tank_uid = base.build_tank(heading=360 * np.random.random())
+            # build_tank() returns the uid of the tank that was built
+            self.tanks_att[base.uid].add(tank_uid)
+            # Add 1 to the tank counter for this base
+            self.ntanks_att[base.uid] += 1
+
+    def build_ship(self, base):
+        if base.crystal > base.cost("ship"):
+            # build_ship() returns the uid of the ship that was built
+            ship_uid = base.build_ship(heading=360 * np.random.random())
+            # Add 1 to the ship counter for this base
+            self.nships[base.uid] += 1
+            self.ships[base.uid].add(ship_uid)
+
+    def build_jet(self, base):
+        if base.crystal > base.cost("jet"):
+            # build_jet() returns the uid of the jet that was built
+            jet_uid = base.build_jet(heading=360 * np.random.random())
+            self.njets[base.uid] += 1
+
+    stages = [
+        Stage("mines", 2, build_mine),
+        Stage("tanks_def", 8, build_tank_def),
+        Stage("mines", 3, build_mine),
+        Stage("ships", 1, build_ship),
+        Stage("tanks_def", 9, build_tank_def),
+        Stage("tanks_att", 2, build_tank_att),
+        Stage("ships", 2, build_ship),
+        Stage("jets", 1, build_jet),
+        Stage("ships", 3, build_ship),
+        Stage("tanks_def", 10, build_tank_def),
+        Stage("jets", 1, build_jet),
+        Stage("tanks_att", 5, build_tank_att),
+    ]
+
+    def update_vehicles(self, player_info):
+        alive_tanks = []
+        if "tanks" in player_info:
+            for tank in player_info["tanks"]:
+                alive_tanks.append(tank.uid)
+
+        for base, tanks in self.tanks_att.items():
+            tanks_to_remove = {tank for tank in tanks if tank not in alive_tanks}
+            for tank in tanks_to_remove:
+                tanks.remove(tank)
+
+        for base, tanks in self.tanks_def.items():
+            tanks_to_remove = {tank for tank in tanks if tank not in alive_tanks}
+            for tank in tanks_to_remove:
+                tanks.remove(tank)
+
+        alive_ships = []
+        if "ships" in player_info:
+            alive_ships = [ship.uid for ship in player_info["ships"]]
+
+        for base, ships in self.ships.items():
+            ships_to_remove = {ship for ship in ships if ship not in alive_ships}
+            for ship in ships_to_remove:
+                ships.remove(ship)
+
+    def get_next_stage(self, base) -> Callable:
+        for stage in self.stages:
+            if stage.item == "mines":
+                if base.mines < stage.count:
+                    return stage.action
+            elif stage.item == "tanks_def":
+                if len(self.tanks_def[base.uid]) < stage.count:
+                    return stage.action
+            elif stage.item == "tanks_att":
+                if len(self.tanks_att[base.uid]) < stage.count:
+                    return stage.action
+            elif stage.item == "ships":
+                if len(self.ships[base.uid]) < stage.count:
+                    return stage.action
+            elif stage.item == "jets":
+                if self.njets[base.uid] < stage.count:
+                    return stage.action
+        return self.__class__.build_ship
 
     def run(self, t: float, dt: float, info: dict, game_map: np.ndarray):
         """
@@ -81,30 +188,25 @@ class PlayerAi:
         # Iterate through all my bases (vehicles belong to bases)
         for base in myinfo["bases"]:
             # If this is a new base, initialize the tank & ship counters
-            if base.uid not in self.ntanks:
-                self.ntanks[base.uid] = 0
+            if base.uid not in self.ntanks_def:
+                self.ntanks_def[base.uid] = 0
+                self.ntanks_att[base.uid] = 0
             if base.uid not in self.nships:
                 self.nships[base.uid] = 0
-            # Firstly, each base should build a mine if it has less than 3 mines
-            if base.mines < 3:
-                if base.crystal > base.cost("mine"):
-                    base.build_mine()
-            # Secondly, each base should build a tank if it has less than 5 tanks
-            elif base.crystal > base.cost("tank") and self.ntanks[base.uid] < 5:
-                # build_tank() returns the uid of the tank that was built
-                tank_uid = base.build_tank(heading=360 * np.random.random())
-                # Add 1 to the tank counter for this base
-                self.ntanks[base.uid] += 1
-            # Thirdly, each base should build a ship if it has less than 3 ships
-            elif base.crystal > base.cost("ship") and self.nships[base.uid] < 3:
-                # build_ship() returns the uid of the ship that was built
-                ship_uid = base.build_ship(heading=360 * np.random.random())
-                # Add 1 to the ship counter for this base
-                self.nships[base.uid] += 1
-            # If everything else is satisfied, build a jet
-            elif base.crystal > base.cost("jet"):
-                # build_jet() returns the uid of the jet that was built
-                jet_uid = base.build_jet(heading=360 * np.random.random())
+            if base.uid not in self.njets:
+                self.njets[base.uid] = 0
+
+            if base.uid not in self.tanks_def:
+                self.tanks_def[base.uid] = set()
+            if base.uid not in self.tanks_att:
+                self.tanks_att[base.uid] = set()
+            if base.uid not in self.ships:
+                self.ships[base.uid] = set()
+
+            self.update_vehicles(myinfo)
+            action = self.get_next_stage(base)
+            print(action)
+            action(self, base)
 
         # Try to find an enemy target
         target = None
@@ -166,6 +268,13 @@ class PlayerAi:
         # Iterate through all my tanks
         if "tanks" in myinfo:
             for tank in myinfo["tanks"]:
+                for base in myinfo["bases"]:
+                    if tank.uid in self.tanks_def[base.uid]:
+                        if 40 < tank.get_distance(base.x, base.y, shortest=True) < 50:
+                            tank.set_heading(-tank.heading)
+                            tank.set_vector(tank.vector * -1)
+        if "tanks" in myinfo:
+            for tank in myinfo["tanks"]:
                 if (tank.uid in self.previous_positions) and (not tank.stopped):
                     # If the tank position is the same as the previous position,
                     # set a random heading
@@ -185,7 +294,11 @@ class PlayerAi:
                     # convert the ship to a base if it is far from the owning base,
                     # set a random heading otherwise
                     if all(ship.position == self.previous_positions[ship.uid]):
-                        if ship.get_distance(ship.owner.x, ship.owner.y) > 20:
+                        if all(
+                            ship.get_distance(base.x, base.y, shortest=True) > 40
+                            for team_info in info.values()
+                            for base in team_info.get("bases", [])
+                        ):
                             ship.convert_to_base()
                         else:
                             ship.set_heading(np.random.random() * 360.0)
@@ -193,6 +306,14 @@ class PlayerAi:
                 self.previous_positions[ship.uid] = ship.position
 
         # Iterate through all my jets
+        if "jets" in myinfo:
+            for jet in myinfo["jets"]:
+                if any(
+                    120 < jet.get_distance(base.x, base.y, shortest=True) < 150
+                    for base in myinfo["bases"]
+                ):
+                    jet.set_heading(-jet.heading)
+                    jet.set_vector(jet.vector * -1)
         if "jets" in myinfo:
             for jet in myinfo["jets"]:
                 # Jets simply go to the target if there is one, they never get stuck
